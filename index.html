@@ -1,0 +1,284 @@
+<!doctype html>
+<!--
+  index.html - the Jazz Jackrabbit toolkit in a browser (Makefile-wasm).
+
+  The toolkit itself is the desktop one (src-ide) compiled with Emscripten;
+  this page gives it what a browser cannot: a way in for the game files and
+  pictures, and a way out for saved and exported files.
+
+    game files    "Load game folder" / "Load game files or ZIP", or dropped
+                  on the page: written flat into /jj1 (a ZIP is unpacked,
+                  folders are walked), then the Sprite Editor asks which
+                  level to open
+    pictures      the editor's Replace buttons open the browser's picker;
+                  a picture dropped on a timeline frame replaces from that
+                  frame: written to /work, then handed to the editor
+    saving        File > Save writes /jj1 as on the desktop, then the page
+                  downloads every game file that differs from what was
+                  loaded as one ZIP (also "Download changed files" here)
+    exports       downloaded as PNGs straight away
+
+  Nothing leaves the browser; reloading the page starts over.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jazz Jackrabbit Toolkit</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1c1630; color: #ddd;
+               font: 14px/1.2 system-ui, sans-serif; overflow: hidden; }
+  #bar { position: fixed; top: 0; left: 0; right: 0; height: 40px; display: flex;
+         align-items: center; gap: 8px; padding: 0 10px; box-sizing: border-box;
+         background: #2a2140; border-bottom: 1px solid #443866; }
+  #bar .brand { color: #ffd640; font-weight: 600; margin-right: 8px; white-space: nowrap; }
+  #bar label, #bar button { background: #e8601c; color: #fff; border: 0; border-radius: 6px;
+         padding: 6px 12px; cursor: pointer; font: inherit; white-space: nowrap; }
+  #bar label.alt, #bar button.alt { background: #249660; }
+  #bar label:hover, #bar button:hover { filter: brightness(1.15); }
+  #bar input[type=file] { display: none; }
+  #msg { margin-left: 8px; color: #bbb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #stage { position: fixed; top: 40px; left: 0; right: 0; bottom: 0; }
+  #canvas { display: block; outline: none; }
+  #stage.drop::after { content: "Drop game files, a ZIP, a folder or a picture";
+         position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+         background: rgba(232, 96, 28, 0.25); border: 3px dashed #ffd640; color: #fff;
+         font-size: 24px; pointer-events: none; }
+  #loading { position: fixed; inset: 40px 0 0 0; display: flex; align-items: center;
+             justify-content: center; font-size: 18px; color: #ffd640; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span class="brand">Jazz Jackrabbit Toolkit</span>
+  <label title="A folder holding MAINCHAR.000, SPRITES.###, BLOCKS.### and LEVEL#.###">
+    Load game folder&hellip;<input id="in-dir" type="file" webkitdirectory multiple></label>
+  <label title="The files themselves, or a ZIP of the install (JAZZ.ZIP)">
+    Load game files or ZIP&hellip;<input id="in-files" type="file" multiple></label>
+  <button id="dl" class="alt" title="Every game file that differs from what was loaded, as one ZIP">
+    Download changed files</button>
+  <span id="msg">Load the game files to start.</span>
+</div>
+<div id="stage"><canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas></div>
+<div id="loading">Loading&hellip;</div>
+<input id="pick" type="file" style="display:none">
+
+<script src="jjzip.js"></script>
+<script>
+'use strict';
+const GAME_DIR = '/jj1', WORK_DIR = '/work';
+const msg = t => { document.getElementById('msg').textContent = t; };
+let loaded = new Map();           /* game file name -> bytes as loaded */
+let ready = false;
+
+const isImage = n => /\.(png|bmp|gif|tga)$/i.test(n);
+const base = n => n.split(/[\\/]/).pop();
+
+function clearDir(dir) {
+    const FS = Module.FS;
+    for (const n of FS.readdir(dir)) {
+        if (n === '.' || n === '..')
+            continue;
+        const p = dir + '/' + n;
+        if (FS.isDir(FS.stat(p).mode)) {
+            clearDir(p);
+            FS.rmdir(p);
+        } else {
+            FS.unlink(p);
+        }
+    }
+}
+
+/* [{name, data}] of everything handed in: ZIPs unpacked, folders flattened */
+async function collect(files) {
+    const out = [];
+    for (const f of files) {
+        const data = new Uint8Array(await f.arrayBuffer());
+        if (/\.zip$/i.test(f.name))
+            for (const e of await jjUnzip(data))
+                out.push({ name: base(e.name), data: e.data });
+        else
+            out.push({ name: base(f.name), data });
+    }
+    return out.filter(e => e.name);
+}
+
+async function loadGame(files) {
+    if (!ready)
+        return;
+    if (Module.ccall('wasm_dirty', 'number', [], []) &&
+        !confirm('The open level has unsaved changes. Load other game files anyway?'))
+        return;
+    msg('Reading game files...');
+    let entries;
+    try {
+        entries = await collect(files);
+    } catch (e) {
+        msg('Cannot read that: ' + e.message);
+        return;
+    }
+    const FS = Module.FS;
+    clearDir(GAME_DIR);
+    loaded = new Map();
+    for (const e of entries) {
+        FS.writeFile(GAME_DIR + '/' + e.name, e.data);
+        loaded.set(e.name, e.data);
+    }
+    const names = entries.map(e => e.name.toUpperCase());
+    const levels = names.filter(n => n.startsWith('LEVEL')).length;
+    if (!names.includes('MAINCHAR.000') || !levels) {
+        msg(entries.length + ' files loaded, but no MAINCHAR.000 or LEVEL files among them.');
+        return;
+    }
+    msg(entries.length + ' game files loaded (' + levels + ' levels). Pick a level.');
+    Module.ccall('wasm_game_loaded', null, ['string'], [GAME_DIR]);
+}
+
+function download(name, data, type) {
+    const url = URL.createObjectURL(new Blob([data], { type: type || 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+function changedFiles(dir) {
+    const FS = Module.FS, out = [];
+    for (const n of FS.readdir(dir)) {
+        const p = dir + '/' + n;
+        if (n === '.' || n === '..' || FS.isDir(FS.stat(p).mode))
+            continue;                    /* backup/ stays behind */
+        const now = FS.readFile(p), was = loaded.get(n);
+        if (!was || was.length !== now.length || now.some((b, i) => b !== was[i]))
+            out.push({ name: n, data: now });
+    }
+    return out;
+}
+
+var Module = {
+    canvas: document.getElementById('canvas'),
+    print: t => console.log(t),
+    printErr: t => console.warn(t),
+    preRun: [() => {
+        Module.FS.mkdir(GAME_DIR);
+        Module.FS.mkdir(WORK_DIR);
+    }],
+    onRuntimeInitialized: () => {
+        ready = true;
+        document.getElementById('loading').remove();
+    },
+
+    /* ---- called from the toolkit (src-wasm/wasm_glue.c) ---- */
+    jjPickFile(accept) {
+        const input = document.getElementById('pick');
+        input.accept = accept;
+        input.value = '';
+        input.onchange = async () => {
+            const f = input.files[0];
+            if (!f)
+                return;
+            const path = WORK_DIR + '/' + base(f.name);
+            Module.FS.writeFile(path, new Uint8Array(await f.arrayBuffer()));
+            Module.ccall('wasm_file_picked', null, ['string'], [path]);
+        };
+        input.click();
+    },
+    jjDownload(path) {
+        try {
+            download(base(path), Module.FS.readFile(path), 'image/png');
+        } catch (e) {
+            /* the export failed; the editor's status line says why */
+        }
+    },
+    jjDownloadChanged(dir) {
+        const files = changedFiles(dir);
+        if (!files.length) {
+            msg('No game file differs from what was loaded.');
+            return;
+        }
+        download('jj1-changed-files.zip', jjZip(files), 'application/zip');
+        msg('Downloaded ' + files.map(f => f.name).join(', ') +
+            ' - unpack over a copy of the install, then make -f Makefile-ide episode JJ1=<that copy>.');
+    },
+};
+
+document.getElementById('in-dir').onchange = e => loadGame([...e.target.files]);
+document.getElementById('in-files').onchange = e => loadGame([...e.target.files]);
+document.getElementById('dl').onclick = () => {
+    if (ready && loaded.size)
+        Module.jjDownloadChanged(GAME_DIR);
+    else
+        msg('Load the game files first.');
+};
+
+/* Ctrl+S is the toolkit's save, not the browser's "save page" */
+document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S'))
+        e.preventDefault();
+}, true);
+
+window.addEventListener('beforeunload', e => {
+    if (ready && Module.ccall('wasm_dirty', 'number', [], [])) {
+        e.preventDefault();
+        e.returnValue = '';
+    }
+});
+
+/* ---- drag and drop ---- */
+const stage = document.getElementById('stage');
+
+/* files from a drop, walking dropped folders */
+async function dropped(dt) {
+    const items = [...(dt.items || [])].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+    if (!items.length)
+        return [...dt.files];
+    const files = [];
+    const walk = entry => new Promise(resolve => {
+        if (entry.isFile) {
+            entry.file(f => { files.push(f); resolve(); }, () => resolve());
+        } else {
+            const reader = entry.createReader(), all = [];
+            const more = () => reader.readEntries(async batch => {
+                if (!batch.length) {
+                    for (const c of all)
+                        await walk(c);
+                    resolve();
+                } else {
+                    all.push(...batch);
+                    more();
+                }
+            }, () => resolve());
+            more();
+        }
+    });
+    for (const it of items)
+        await walk(it);
+    return files;
+}
+
+stage.addEventListener('dragover', e => { e.preventDefault(); stage.classList.add('drop'); });
+stage.addEventListener('dragleave', () => stage.classList.remove('drop'));
+stage.addEventListener('drop', async e => {
+    e.preventDefault();
+    e.stopPropagation();
+    stage.classList.remove('drop');
+    if (!ready)
+        return;
+    const r = Module.canvas.getBoundingClientRect();
+    const x = Math.round(e.clientX - r.left), y = Math.round(e.clientY - r.top);
+    const files = await dropped(e.dataTransfer);
+    if (files.length === 1 && isImage(files[0].name)) {
+        const path = WORK_DIR + '/' + base(files[0].name);
+        Module.FS.writeFile(path, new Uint8Array(await files[0].arrayBuffer()));
+        Module.ccall('wasm_dropped', null, ['string', 'number', 'number'], [path, x, y]);
+    } else if (files.length) {
+        loadGame(files);
+    }
+}, true);
+</script>
+<script src="jjtoolkit.js"></script>
+</body>
+</html>
