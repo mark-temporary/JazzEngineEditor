@@ -17,6 +17,12 @@
                   downloads every game file that differs from what was
                   loaded as one ZIP (also "Download changed files" here)
     exports       downloaded as PNGs straight away
+    playtest      "Playtest" runs the open editor's level (from the start
+                  screen: the title screen) in the engine runtime, which
+                  is linked into the toolkit, on the files in memory -
+                  unsaved edits included; Esc comes back.  (The desktop
+                  build has this as Build > Playtest.)  play.html is the
+                  same runtime on its own page.
 
   Nothing leaves the browser; reloading the page starts over.
 -->
@@ -57,6 +63,8 @@
     Load game files or ZIP&hellip;<input id="in-files" type="file" multiple></label>
   <button id="dl" class="alt" title="Every game file that differs from what was loaded, as one ZIP">
     Download changed files</button>
+  <button id="play" class="alt" title="Play the open level (unsaved edits included) in the engine runtime; Esc comes back">
+    Playtest</button>
   <span id="msg">Load the game files to start.</span>
 </div>
 <div id="stage"><canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas></div>
@@ -212,6 +220,16 @@ document.getElementById('dl').onclick = () => {
         Module.jjDownloadChanged(GAME_DIR);
     else
         msg('Load the game files first.');
+};
+document.getElementById('play').onclick = e => {
+    /* keys go to the game, not to a focused button (Space would press it) */
+    e.currentTarget.blur();
+    if (!ready || !loaded.size) {
+        msg('Load the game files first.');
+        return;
+    }
+    Module.ccall('wasm_playtest', null, [], []);
+    msg('Playtest: arrows move, Space jumps, Ctrl fires, Tab switches weapon, Enter pauses - Esc returns to the editor.');
 };
 
 /* Ctrl+S is the toolkit's save, not the browser's "save page" */

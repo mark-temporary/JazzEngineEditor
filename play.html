@@ -1,0 +1,166 @@
+<!doctype html>
+<!--
+  play.html - the Jazz Jackrabbit engine runtime in a browser (Makefile-wasm).
+
+  The runtime is the desktop one (src-sdl, Makefile-sdl's jazzsdl) compiled
+  with Emscripten: the consoles' game core with a front end that reads the
+  original game files.  This page gives it the files: "Load game folder" /
+  "Load game files or ZIP", or dropped on the page, are written flat into
+  /jj1 (a ZIP is unpacked, folders are walked) and the title screen comes up
+  with the episodes and levels found there.
+
+  Keys: arrows move, Space jumps, Ctrl fires, Tab switches weapon, Enter
+  pauses, Esc goes back to the title screen.  A gamepad works too.
+
+  Nothing leaves the browser.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jazz Jackrabbit</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd;
+               font: 14px/1.2 system-ui, sans-serif; overflow: hidden; }
+  #bar { position: fixed; top: 0; left: 0; right: 0; height: 40px; display: flex;
+         align-items: center; gap: 8px; padding: 0 10px; box-sizing: border-box;
+         background: #2a2140; border-bottom: 1px solid #443866; }
+  #bar .brand { color: #ffd640; font-weight: 600; margin-right: 8px; white-space: nowrap; }
+  #bar label { background: #e8601c; color: #fff; border: 0; border-radius: 6px;
+         padding: 6px 12px; cursor: pointer; font: inherit; white-space: nowrap; }
+  #bar label:hover { filter: brightness(1.15); }
+  #bar input[type=file] { display: none; }
+  #msg { margin-left: 8px; color: #bbb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #stage { position: fixed; top: 40px; left: 0; right: 0; bottom: 0; }
+  #canvas { display: block; outline: none; }
+  #stage.drop::after { content: "Drop the game files, a ZIP or a folder";
+         position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+         background: rgba(232, 96, 28, 0.25); border: 3px dashed #ffd640; color: #fff;
+         font-size: 24px; pointer-events: none; }
+  #loading { position: fixed; inset: 40px 0 0 0; display: flex; align-items: center;
+             justify-content: center; font-size: 18px; color: #ffd640; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span class="brand">Jazz Jackrabbit</span>
+  <label title="A folder holding the game: LEVEL#.###, BLOCKS.###, MAINCHAR.000, SPRITES.###, PANEL.000, SOUNDS.000">
+    Load game folder&hellip;<input id="in-dir" type="file" webkitdirectory multiple></label>
+  <label title="The files themselves, or a ZIP of the install">
+    Load game files or ZIP&hellip;<input id="in-files" type="file" multiple></label>
+  <span id="msg">Load the game files to play.</span>
+</div>
+<div id="stage"><canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas></div>
+<div id="loading">Loading&hellip;</div>
+
+<script src="jjzip.js"></script>
+<script>
+'use strict';
+const GAME_DIR = '/jj1';
+const msg = t => { document.getElementById('msg').textContent = t; };
+const base = n => n.split(/[\\/]/).pop();
+let ready = false;
+
+function clearDir(dir) {
+    const FS = Module.FS;
+    for (const n of FS.readdir(dir)) {
+        if (n === '.' || n === '..')
+            continue;
+        const p = dir + '/' + n;
+        if (FS.isDir(FS.stat(p).mode)) {
+            clearDir(p);
+            FS.rmdir(p);
+        } else {
+            FS.unlink(p);
+        }
+    }
+}
+
+async function collect(files) {
+    const out = [];
+    for (const f of files) {
+        const data = new Uint8Array(await f.arrayBuffer());
+        if (/\.zip$/i.test(f.name))
+            for (const e of await jjUnzip(data))
+                out.push({ name: base(e.name), data: e.data });
+        else
+            out.push({ name: base(f.name), data });
+    }
+    return out.filter(e => e.name);
+}
+
+async function loadGame(files) {
+    if (!ready)
+        return;
+    msg('Reading game files...');
+    let entries;
+    try {
+        entries = await collect(files);
+    } catch (e) {
+        msg('Cannot read that: ' + e.message);
+        return;
+    }
+    clearDir(GAME_DIR);
+    for (const e of entries)
+        Module.FS.writeFile(GAME_DIR + '/' + e.name, e.data);
+    const levels = entries.filter(e => /^LEVEL\d\.\d{3}$/i.test(e.name)).length;
+    msg(entries.length + ' files loaded (' + levels + ' levels). ' +
+        'Arrows move, Space jumps, Ctrl fires, Tab switches weapon, Enter pauses, Esc: title screen.');
+    Module.ccall('wasm_rt_loaded', null, ['string'], [GAME_DIR]);
+}
+
+var Module = {
+    canvas: document.getElementById('canvas'),
+    print: t => console.log(t),
+    printErr: t => console.warn(t),
+    preRun: [() => { Module.FS.mkdir(GAME_DIR); }],
+    onRuntimeInitialized: () => {
+        ready = true;
+        document.getElementById('loading').remove();
+    },
+};
+
+document.getElementById('in-dir').onchange = e => loadGame([...e.target.files]);
+document.getElementById('in-files').onchange = e => loadGame([...e.target.files]);
+
+const stage = document.getElementById('stage');
+async function dropped(dt) {
+    const items = [...(dt.items || [])].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+    if (!items.length)
+        return [...dt.files];
+    const files = [];
+    const walk = entry => new Promise(resolve => {
+        if (entry.isFile) {
+            entry.file(f => { files.push(f); resolve(); }, () => resolve());
+        } else {
+            const reader = entry.createReader(), all = [];
+            const more = () => reader.readEntries(async batch => {
+                if (!batch.length) {
+                    for (const c of all)
+                        await walk(c);
+                    resolve();
+                } else {
+                    all.push(...batch);
+                    more();
+                }
+            }, () => resolve());
+            more();
+        }
+    });
+    for (const it of items)
+        await walk(it);
+    return files;
+}
+stage.addEventListener('dragover', e => { e.preventDefault(); stage.classList.add('drop'); });
+stage.addEventListener('dragleave', () => stage.classList.remove('drop'));
+stage.addEventListener('drop', async e => {
+    e.preventDefault();
+    stage.classList.remove('drop');
+    const files = await dropped(e.dataTransfer);
+    if (files.length)
+        loadGame(files);
+}, true);
+</script>
+<script src="jazzsdl.js"></script>
+</body>
+</html>
